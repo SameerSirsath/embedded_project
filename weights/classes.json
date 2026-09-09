@@ -1,0 +1,33 @@
+{
+    "model_name": "YOLOv8 Obstacle Detector",
+    "num_classes": 9,
+    "classes": [
+        "car",
+        "bike",
+        "bus",
+        "chair",
+        "table",
+        "pole",
+        "person",
+        "stairs",
+        "wall"
+    ],
+    "class_dict": {
+        "0": "car",
+        "1": "bike",
+        "2": "bus",
+        "3": "chair",
+        "4": "table",
+        "5": "pole",
+        "6": "person",
+        "7": "stairs",
+        "8": "wall"
+    },
+    "imgsz": 640,
+    "target_hardware": [
+        "PyCharm",
+        "ESP32 Companion",
+        "Raspberry Pi",
+        "Jetson"
+    ]
+}

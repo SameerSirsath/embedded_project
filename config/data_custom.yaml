@@ -1,0 +1,20 @@
+# YOLO Dataset Configuration for Obstacle Detection
+# Use this configuration if you train on a local dataset instead of Roboflow.
+# Ensure paths point to your image directories (relative to this file or absolute).
+
+path: ../data/dataset # Dataset root directory
+train: images/train   # Train images (relative to 'path')
+val: images/val       # Validation images (relative to 'path')
+test: images/test     # Optional test images
+
+# Target obstacle classes relevant to assistive navigation & robotics
+names:
+  0: car
+  1: bike
+  2: bus
+  3: chair
+  4: table
+  5: pole
+  6: person
+  7: stairs
+  8: wall

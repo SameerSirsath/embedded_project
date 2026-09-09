@@ -1,0 +1,29 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Datasets and archives
+datasets/
+*.zip
+*.tar.gz
+
+# YOLO training run directories
+runs/detect/
+runs/train/
+runs/test_train/
+
+# PyCharm / IDE user settings
+.idea/workspace.xml
+.idea/usageTracker.xml
+.idea/shelf/
+.idea/httpRequests/
+
+# Checkpoint temporary backups
+*.pt.backup
