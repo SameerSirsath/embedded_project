@@ -25,6 +25,7 @@ embedded_project/
 ├── train_obstacle_detector.ipynb    # Complete training & model export notebook
 ├── test_obstacle_detector.ipynb     # Interactive testing notebook in PyCharm
 ├── test_obstacle_detector.py        # Standalone Python inference script (webcam, video, images)
+├── live_camera_detection.py         # Dedicated live camera detection script (interactive HUD & voice)
 └── README.md                        # Documentation & setup guide
 ```
 
@@ -111,6 +112,28 @@ python test_obstacle_detector.py --source 0 --assistive
 ```bash
 python test_obstacle_detector.py --source path/to/navigation_video.mp4 --conf 0.4
 ```
+
+### Option C: Live Real-Time Camera Detection (`live_camera_detection.py`)
+Run real-time obstacle detection directly from your webcam, USB camera, or ESP32-CAM stream with audio alerts and interactive HUD:
+
+```bash
+# Default Laptop/Built-in Webcam
+python live_camera_detection.py
+
+# External USB Camera (Index 1)
+python live_camera_detection.py --cam 1
+
+# ESP32-CAM or IP Camera Stream
+python live_camera_detection.py --cam http://192.168.1.100:81/stream
+```
+
+**Interactive Controls During Live Camera Feed**:
+- **`[q]` / `[ESC]`**: Exit stream
+- **`[s]`**: Save snapshot to `runs/live_snapshots/`
+- **`[c]`**: Toggle Navigation Corridor HUD (Left / Center / Right)
+- **`[v]`**: Toggle Spoken Voice Alerts
+- **`[+]` / `[-]`**: Adjust detection confidence threshold live on screen
+
 
 #### 5. Headless Mode (Automated / No GUI Popup)
 ```bash
