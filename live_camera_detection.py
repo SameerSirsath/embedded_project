@@ -409,10 +409,22 @@ def run_live_camera(args):
                 cam_label=label_for_hud
             )
 
-            cv2.imshow(window_name, display_frame)
+            if not args.no_show:
+                try:
+                    cv2.imshow(window_name, display_frame)
+                    key = cv2.waitKey(1) & 0xFF
+                except Exception:
+                    print("\n[!] GUI display not available (headless environment). Running in terminal mode...")
+                    args.no_show = True
+                    key = 255
+            else:
+                key = 255
+                if alerts:
+                    top = alerts[0]
+                    print(f"\r>> ALERT: {top['label'].upper()} in {top['zone']} ({top['proximity']}) | FPS: {avg_fps:.1f}   ", end="", flush=True)
+                time.sleep(0.01)
 
             # 8. Keyboard Controls
-            key = cv2.waitKey(1) & 0xFF
             if key in [ord('q'), 27]:  # 'q' or ESC
                 print("[*] Stream stopped by user.")
                 break
@@ -472,6 +484,7 @@ def main():
         help="Device: '0' for CUDA GPU, 'cpu' for CPU"
     )
     parser.add_argument("--no-voice", action="store_true", help="Disable spoken voice alerts")
+    parser.add_argument("--no-show", action="store_true", help="Run headless in terminal without GUI window")
 
     args = parser.parse_args()
     run_live_camera(args)
