@@ -28,7 +28,7 @@ import numpy as np
 import requests
 from ultralytics import YOLO
 
-# GPS imports with safe fallback
+# Safe GPS library import
 try:
     import serial
     import pynmea2
@@ -37,13 +37,13 @@ except ImportError:
     HAS_GPS_LIBS = False
     print("[!] 'pyserial' or 'pynmea2' not installed. GPS will run in simulated mode.")
 
-# GPIO import with safe fallback for testing
+# Safe GPIO library import
 try:
     import RPi.GPIO as GPIO
     HAS_RPI_GPIO = True
-except (ImportError, RuntimeError):
+except Exception:
     HAS_RPI_GPIO = False
-    print("[!] RPi.GPIO not detected. Running in simulation mode for GPIO pins.")
+    print("[!] RPi.GPIO not available. Running in simulation mode for GPIO pins.")
 
 
 # =========================================================
@@ -69,16 +69,20 @@ BUTTON = 17
 BUZZER = 18
 
 if HAS_RPI_GPIO:
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setwarnings(False)
+    try:
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setwarnings(False)
 
-    GPIO.setup(TRIG, GPIO.OUT)
-    GPIO.setup(ECHO, GPIO.IN)
+        GPIO.setup(TRIG, GPIO.OUT)
+        GPIO.setup(ECHO, GPIO.IN)
 
-    GPIO.setup(BUTTON, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.setup(BUTTON, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
-    GPIO.setup(BUZZER, GPIO.OUT)
-    GPIO.output(BUZZER, GPIO.LOW)
+        GPIO.setup(BUZZER, GPIO.OUT)
+        GPIO.output(BUZZER, GPIO.LOW)
+    except Exception as e:
+        print(f"[!] GPIO initialization warning: {e}")
+        HAS_RPI_GPIO = False
 
 
 # =========================================================
@@ -99,34 +103,32 @@ if HAS_GPS_LIBS:
 # =========================================================
 
 def get_distance():
-    """Measures distance in cm using the HC-SR04 ultrasonic sensor."""
+    """Measures distance in cm using the HC-SR04 ultrasonic sensor with timeout safety."""
     if not HAS_RPI_GPIO:
         return -1
 
     try:
         GPIO.output(TRIG, False)
-        time.sleep(0.01)
+        time.sleep(0.005)
 
         GPIO.output(TRIG, True)
         time.sleep(0.00001)
         GPIO.output(TRIG, False)
 
-        pulse_start = None
-        pulse_end = None
-        timeout = time.time()
+        pulse_start = time.time()
+        timeout = pulse_start + 0.04
 
         while GPIO.input(ECHO) == 0:
             pulse_start = time.time()
-            if pulse_start - timeout > 0.04:
+            if pulse_start > timeout:
                 return -1
 
+        pulse_end = time.time()
+        timeout = pulse_end + 0.04
         while GPIO.input(ECHO) == 1:
             pulse_end = time.time()
-            if pulse_end - timeout > 0.04:
+            if pulse_end > timeout:
                 return -1
-
-        if pulse_start is None or pulse_end is None:
-            return -1
 
         duration = pulse_end - pulse_start
         distance = duration * 17150
@@ -141,21 +143,23 @@ def get_distance():
 
 def get_gps_location():
     """Reads NMEA sentences from GPS module to extract latitude & longitude."""
-    if gps_serial is None:
+    if gps_serial is None or not HAS_GPS_LIBS:
         return None, None
 
     start_time = time.time()
-    while time.time() - start_time < 12:
+    while time.time() - start_time < 5.0:
         try:
-            data = gps_serial.readline().decode('ascii', errors='replace')
-            if data.startswith('$GPGGA'):
-                msg = pynmea2.parse(data)
-                latitude = msg.latitude
-                longitude = msg.longitude
-                if latitude != 0 and longitude != 0:
-                    return latitude, longitude
+            if hasattr(gps_serial, 'in_waiting') and gps_serial.in_waiting:
+                data = gps_serial.readline().decode('ascii', errors='replace')
+                if data.startswith('$GPGGA') or data.startswith('$GNGGA'):
+                    msg = pynmea2.parse(data)
+                    latitude = msg.latitude
+                    longitude = msg.longitude
+                    if latitude != 0 and longitude != 0:
+                        return latitude, longitude
         except Exception:
             pass
+        time.sleep(0.05)
 
     return None, None
 
@@ -324,7 +328,7 @@ def analyze_navigation_corridors(w: int, h: int, boxes, names_map):
 
 
 def generate_voice_alert(alert):
-    """Formats natural directional speech prompt for the visually impaired."""
+    """Formats natural directional speech prompt for visually impaired navigation."""
     label = alert["label"]
     zone = alert["zone"]
     urgency = alert["urgency"]
@@ -354,12 +358,16 @@ def generate_voice_alert(alert):
 class VideoStream:
     """Threaded VideoStream for smooth, low-latency webcam capture."""
     def __init__(self, src=0, resolution=(640, 480)):
-        self.stream = cv2.VideoCapture(src)
+        cam_src = int(src) if str(src).isdigit() else str(src)
+        self.stream = cv2.VideoCapture(cam_src)
+        if not self.stream.isOpened() and isinstance(cam_src, int) and os.name == 'nt':
+            self.stream = cv2.VideoCapture(cam_src, cv2.CAP_DSHOW)
+
         self.stream.set(cv2.CAP_PROP_FRAME_WIDTH, resolution[0])
         self.stream.set(cv2.CAP_PROP_FRAME_HEIGHT, resolution[1])
         self.stream.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-        (self.grabbed, self.frame) = self.stream.read()
+        self.grabbed, self.frame = self.stream.read()
         self.stopped = False
 
     def start(self):
@@ -368,8 +376,14 @@ class VideoStream:
 
     def update(self):
         while not self.stopped:
-            (self.grabbed, self.frame) = self.stream.read()
-            if not self.grabbed:
+            if not self.stream.isOpened():
+                time.sleep(0.02)
+                continue
+            grabbed, frame = self.stream.read()
+            if grabbed and frame is not None:
+                self.grabbed = grabbed
+                self.frame = frame
+            else:
                 time.sleep(0.01)
 
     def read(self):
@@ -377,12 +391,24 @@ class VideoStream:
 
     def stop(self):
         self.stopped = True
-        self.stream.release()
+        if self.stream.isOpened():
+            self.stream.release()
 
 
 # =========================================================
-# ---------------- MODEL RESOLVER -------------------------
+# ---------------- MODEL & HARDWARE RESOLVER --------------
 # =========================================================
+
+def get_inference_device():
+    """Detects available hardware without hard dependency on torch."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "0"
+    except Exception:
+        pass
+    return "cpu"
+
 
 def resolve_model_path(user_path: str) -> str:
     candidates = [
@@ -399,224 +425,222 @@ def resolve_model_path(user_path: str) -> str:
 
 
 # =========================================================
-# ---------------- ARGUMENTS ------------------------------
+# ---------------- MAIN FUNCTION --------------------------
 # =========================================================
 
-parser = argparse.ArgumentParser(description="Smart AI Navigation Cane - YOLO & IoT Fusion")
-parser.add_argument('--weights', default='weights/obstacle_yolo_best.onnx', help='Path to model weights (.onnx or .pt)')
-parser.add_argument('--conf', type=float, default=0.35, help='Confidence threshold')
-parser.add_argument('--cam', default='0', help='Camera index or stream URL')
-parser.add_argument('--resolution', default='640x480', help='Camera resolution WxH')
-parser.add_argument('--no-show', action='store_true', help='Run headless without GUI window')
-args = parser.parse_args()
+def main():
+    parser = argparse.ArgumentParser(description="Smart AI Navigation Cane - YOLO & IoT Fusion")
+    parser.add_argument('--weights', default='weights/obstacle_yolo_best.onnx', help='Path to model weights (.onnx or .pt)')
+    parser.add_argument('--conf', type=float, default=0.35, help='Confidence threshold')
+    parser.add_argument('--cam', default='0', help='Camera index or stream URL')
+    parser.add_argument('--resolution', default='640x480', help='Camera resolution WxH')
+    parser.add_argument('--no-show', action='store_true', help='Run headless without GUI window')
+    args = parser.parse_args()
 
-resW, resH = args.resolution.split('x')
-imW, imH = int(resW), int(resH)
+    resW, resH = args.resolution.split('x')
+    imW, imH = int(resW), int(resH)
 
+    print("\n" + "=" * 65)
+    print(" 🦯 SMART AI NAVIGATION CANE - SYSTEM STARTING")
+    print("=" * 65)
 
-# =========================================================
-# ---------------- LOAD MODEL & AUDIO ---------------------
-# =========================================================
+    # 1. Initialize Audio Engine
+    audio_announcer = AsyncAudioAnnouncer(cooldown=3.0)
+    audio_announcer.speak("Smart AI Cane active. Audio connected.", force=True)
 
-print("\n" + "=" * 65)
-print(" 🦯 SMART AI NAVIGATION CANE - SYSTEM STARTING")
-print("=" * 65)
+    # 2. Load YOLO Model
+    model_file = resolve_model_path(args.weights)
+    print(f"[+] Loading Detection Model: {model_file}")
+    model = YOLO(model_file)
+    device = get_inference_device()
+    print(f"[+] Hardware Accelerator   : {device} ({'GPU Mode' if device == '0' else 'CPU Mode'})")
 
-# 1. Initialize Audio Engine
-audio_announcer = AsyncAudioAnnouncer(cooldown=3.0)
-audio_announcer.speak("Smart AI Cane active. Audio connected.", force=True)
+    # 3. Start Video Stream
+    cam_index = int(args.cam) if str(args.cam).isdigit() else str(args.cam)
+    print(f"[+] Initializing Camera     : {cam_index}")
+    videostream = VideoStream(src=cam_index, resolution=(imW, imH)).start()
+    time.sleep(1.0)
 
-# 2. Load YOLO Model
-model_file = resolve_model_path(args.weights)
-print(f"[+] Loading Detection Model: {model_file}")
-model = YOLO(model_file)
-device = "0" if torch.cuda.is_available() else "cpu"
-print(f"[+] Hardware Accelerator   : {device} ({'GPU Acceleration' if device == '0' else 'Raspberry Pi CPU Mode'})")
+    frame_count = 0
+    distance = -1
+    last_sos_time = 0.0
+    last_ultrasonic_speech = 0.0
+    fps_history = []
 
-# 3. Start Video Stream
-cam_index = int(args.cam) if str(args.cam).isdigit() else str(args.cam)
-print(f"[+] Initializing Camera     : {cam_index}")
-videostream = VideoStream(src=cam_index, resolution=(imW, imH)).start()
-time.sleep(1.0)
+    print("\n[✓] SYSTEM ONLINE & MONITORING!")
+    print("    Press [q] or [ESC] on screen to quit.\n")
 
-frame_count = 0
-distance = -1
-last_sos_time = 0.0
-last_ultrasonic_speech = 0.0
-fps_history = []
+    try:
+        while True:
+            t0 = time.perf_counter()
+            frame1 = videostream.read()
+            if frame1 is None:
+                time.sleep(0.01)
+                continue
 
-print("\n[✓] SYSTEM ONLINE & MONITORING!")
-print("    Press [q] or [ESC] on screen to quit.\n")
+            frame = frame1.copy()
+            frame_count += 1
 
+            # -----------------------------------------------------
+            # 1. Ultrasonic Sensor Reading (Every 4 frames)
+            # -----------------------------------------------------
+            if frame_count % 4 == 0:
+                distance = get_distance()
 
-# =========================================================
-# ---------------- MAIN REAL-TIME LOOP --------------------
-# =========================================================
+            # -----------------------------------------------------
+            # 2. SOS Emergency Button Check
+            # -----------------------------------------------------
+            if HAS_RPI_GPIO and GPIO.input(BUTTON) == 0:
+                current_time = time.time()
+                if current_time - last_sos_time > 15:
+                    print("\n🚨 SOS BUTTON PRESSED! Sending emergency alerts...")
+                    audio_announcer.speak("Emergency alert activated! Sending live location.", force=True)
 
-try:
-    while True:
-        t0 = time.perf_counter()
-        frame1 = videostream.read()
-        if frame1 is None:
-            time.sleep(0.01)
-            continue
+                    lat, lon = get_gps_location()
+                    if lat and lon:
+                        maps_link = f"https://maps.google.com/?q={lat},{lon}"
+                        message = f"🚨 EMERGENCY ALERT!\n\nUser pressed the SOS button.\n\n📍 Live Location:\n{maps_link}"
+                    else:
+                        message = "🚨 EMERGENCY ALERT!\n\nUser pressed the SOS button.\n(GPS location pending)"
 
-        frame = frame1.copy()
-        frame_count += 1
+                    send_telegram_message(message)
+                    last_sos_time = current_time
 
-        # -----------------------------------------------------
-        # 1. Ultrasonic Sensor Reading (Every 4 frames)
-        # -----------------------------------------------------
-        if frame_count % 4 == 0:
-            distance = get_distance()
+            # -----------------------------------------------------
+            # 3. Ultrasonic Close Obstacle Priority Check (< 30 cm)
+            # -----------------------------------------------------
+            if distance != -1 and distance < 30:
+                if HAS_RPI_GPIO:
+                    GPIO.output(BUZZER, GPIO.HIGH)
 
-        # -----------------------------------------------------
-        # 2. SOS Emergency Button Check
-        # -----------------------------------------------------
-        if HAS_RPI_GPIO and GPIO.input(BUTTON) == 0:
-            current_time = time.time()
-            if current_time - last_sos_time > 15:
-                print("\n🚨 SOS BUTTON PRESSED! Sending emergency alerts...")
-                audio_announcer.speak("Emergency alert activated! Sending live location.", force=True)
+                current_time = time.time()
+                if (current_time - last_ultrasonic_speech) > 4.0:
+                    audio_announcer.speak(f"Stop! Obstacle very close at {int(distance)} centimeters!", force=True)
+                    last_ultrasonic_speech = current_time
+            else:
+                if HAS_RPI_GPIO:
+                    GPIO.output(BUZZER, GPIO.LOW)
 
-                lat, lon = get_gps_location()
-                if lat and lon:
-                    maps_link = f"https://maps.google.com/?q={lat},{lon}"
-                    message = f"🚨 EMERGENCY ALERT!\n\nUser pressed the SOS button.\n\n📍 Live Location:\n{maps_link}"
-                else:
-                    message = "🚨 EMERGENCY ALERT!\n\nUser pressed the SOS button.\n(GPS fix pending, location unavailable)"
+            # -----------------------------------------------------
+            # 4. YOLO Object & Obstacle Detection
+            # -----------------------------------------------------
+            results = model(
+                frame,
+                conf=args.conf,
+                imgsz=640,
+                device=device,
+                verbose=False
+            )[0]
 
-                send_telegram_message(message)
-                last_sos_time = current_time
+            # -----------------------------------------------------
+            # 5. Spatial Navigation Corridors & Priority Alerts
+            # -----------------------------------------------------
+            alerts = analyze_navigation_corridors(imW, imH, results.boxes, results.names)
 
-        # -----------------------------------------------------
-        # 3. Ultrasonic Close Obstacle Priority Check (< 30 cm)
-        # -----------------------------------------------------
-        if distance != -1 and distance < 30:
-            if HAS_RPI_GPIO:
-                GPIO.output(BUZZER, GPIO.HIGH)
+            # Voice announcements for camera obstacles (if ultrasonic is not actively alarming)
+            if alerts and (distance == -1 or distance >= 30):
+                top_hazard = alerts[0]
+                if top_hazard["urgency"] >= 2:  # Warning or Critical
+                    voice_msg = generate_voice_alert(top_hazard)
+                    audio_announcer.speak(voice_msg)
 
-            current_time = time.time()
-            if (current_time - last_ultrasonic_speech) > 4.0:
-                audio_announcer.speak(f"Stop! Obstacle very close at {int(distance)} centimeters!", force=True)
-                last_ultrasonic_speech = current_time
-        else:
-            if HAS_RPI_GPIO:
-                GPIO.output(BUZZER, GPIO.LOW)
+            # -----------------------------------------------------
+            # 6. FPS Calculation
+            # -----------------------------------------------------
+            dt = time.perf_counter() - t0
+            fps = 1.0 / max(dt, 1e-4)
+            fps_history.append(fps)
+            if len(fps_history) > 15:
+                fps_history.pop(0)
+            avg_fps = sum(fps_history) / len(fps_history)
 
-        # -----------------------------------------------------
-        # 4. YOLO Object & Obstacle Detection
-        # -----------------------------------------------------
-        results = model(
-            frame,
-            conf=args.conf,
-            imgsz=640,
-            device=device,
-            verbose=False
-        )[0]
+            # -----------------------------------------------------
+            # 7. Draw Visual Corridor HUD & Annotations
+            # -----------------------------------------------------
+            line1 = int(imW * 0.33)
+            line2 = int(imW * 0.66)
 
-        # -----------------------------------------------------
-        # 5. Spatial Navigation Corridors & Priority Alerts
-        # -----------------------------------------------------
-        alerts = analyze_navigation_corridors(imW, imH, results.boxes, results.names)
+            # Corridor guide lines
+            cv2.line(frame, (line1, 0), (line1, imH), (0, 255, 255), 1)
+            cv2.line(frame, (line2, 0), (line2, imH), (0, 255, 255), 1)
 
-        # Voice announcements for camera obstacles (if ultrasonic is not already alarming)
-        if alerts and (distance == -1 or distance >= 30):
-            top_hazard = alerts[0]
-            if top_hazard["urgency"] >= 2:  # Warning or Critical
-                voice_msg = generate_voice_alert(top_hazard)
-                audio_announcer.speak(voice_msg)
+            # Top Status Banner
+            cv2.rectangle(frame, (0, 0), (imW, 34), (20, 20, 20), -1)
+            cv2.putText(frame, "LEFT", (15, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
+            cv2.putText(frame, "CENTER (DIRECT PATH)", (line1 + 10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 140, 255), 2)
+            cv2.putText(frame, "RIGHT", (line2 + 15, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
 
-        # -----------------------------------------------------
-        # 6. FPS Calculation
-        # -----------------------------------------------------
-        dt = time.perf_counter() - t0
-        fps = 1.0 / max(dt, 1e-4)
-        fps_history.append(fps)
-        if len(fps_history) > 15:
-            fps_history.pop(0)
-        avg_fps = sum(fps_history) / len(fps_history)
+            dist_str = f"Dist: {int(distance)}cm" if distance != -1 else "Dist: --"
+            stat_tag = f"FPS: {avg_fps:.1f} | {dist_str}"
+            cv2.putText(frame, stat_tag, (imW - 170, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 180), 1)
 
-        # -----------------------------------------------------
-        # 7. Draw Visual Corridor HUD & Annotations
-        # -----------------------------------------------------
-        line1 = int(imW * 0.33)
-        line2 = int(imW * 0.66)
+            # Draw detected bounding boxes
+            for a in alerts:
+                x1, y1, x2, y2 = a["bbox"]
+                color = (0, 0, 255) if a["urgency"] == 3 else ((0, 165, 255) if a["urgency"] == 2 else (0, 220, 0))
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-        # Corridor guide lines
-        cv2.line(frame, (line1, 0), (line1, imH), (0, 255, 255), 1)
-        cv2.line(frame, (line2, 0), (line2, imH), (0, 255, 255), 1)
+                label_txt = f"{a['label'].upper()} [{a['zone']}] {a['conf']*100:.0f}%"
+                (tw, th), _ = cv2.getTextSize(label_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                cv2.rectangle(frame, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), color, -1)
+                cv2.putText(frame, label_txt, (x1 + 3, y1 - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
 
-        # Top Status Banner
-        cv2.rectangle(frame, (0, 0), (imW, 34), (20, 20, 20), -1)
-        cv2.putText(frame, "LEFT", (15, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        cv2.putText(frame, "CENTER (DIRECT PATH)", (line1 + 10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 140, 255), 2)
-        cv2.putText(frame, "RIGHT", (line2 + 15, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-
-        dist_str = f"Dist: {int(distance)}cm" if distance != -1 else "Dist: --"
-        stat_tag = f"FPS: {avg_fps:.1f} | {dist_str}"
-        cv2.putText(frame, stat_tag, (imW - 170, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 180), 1)
-
-        # Draw detected bounding boxes
-        for a in alerts:
-            x1, y1, x2, y2 = a["bbox"]
-            color = (0, 0, 255) if a["urgency"] == 3 else ((0, 165, 255) if a["urgency"] == 2 else (0, 220, 0))
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-            label_txt = f"{a['label'].upper()} [{a['zone']}] {a['conf']*100:.0f}%"
-            (tw, th), _ = cv2.getTextSize(label_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-            cv2.rectangle(frame, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), color, -1)
-            cv2.putText(frame, label_txt, (x1 + 3, y1 - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
-
-        # Bottom Alert Bar
-        cv2.rectangle(frame, (0, imH - 35), (imW, imH), (15, 15, 15), -1)
-        if distance != -1 and distance < 30:
-            msg = f">> DANGER: OBJECT {int(distance)}cm CLOSE (BUZZER ACTIVE) <<"
-            bcol = (0, 0, 255)
-        elif alerts:
-            top = alerts[0]
-            msg = f">> {top['label'].upper()} in {top['zone']} - {top['proximity']} <<"
-            bcol = (0, 0, 255) if top["urgency"] == 3 else ((0, 180, 255) if top["urgency"] == 2 else (100, 220, 100))
-        else:
-            msg = ">> PATH CLEAR - Safe to proceed <<"
-            bcol = (0, 255, 100)
-
-        cv2.putText(frame, msg, (15, imH - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, bcol, 2, cv2.LINE_AA)
-
-        # -----------------------------------------------------
-        # 8. Render Frame / Handle Headless
-        # -----------------------------------------------------
-        if not args.no_show:
-            try:
-                cv2.imshow('🦯 Smart AI Navigation Cane', frame)
-                if cv2.waitKey(1) == ord('q'):
-                    break
-            except Exception:
-                args.no_show = True
-
-        if args.no_show:
-            if alerts:
+            # Bottom Alert Bar
+            cv2.rectangle(frame, (0, imH - 35), (imW, imH), (15, 15, 15), -1)
+            if distance != -1 and distance < 30:
+                msg = f">> DANGER: OBJECT {int(distance)}cm CLOSE (BUZZER ACTIVE) <<"
+                bcol = (0, 0, 255)
+            elif alerts:
                 top = alerts[0]
-                print(f"\r[ALERT] {top['label'].upper()} in {top['zone']} ({top['proximity']}) | {dist_str} | FPS: {avg_fps:.1f}   ", end="", flush=True)
-            time.sleep(0.01)
+                msg = f">> {top['label'].upper()} in {top['zone']} - {top['proximity']} <<"
+                bcol = (0, 0, 255) if top["urgency"] == 3 else ((0, 180, 255) if top["urgency"] == 2 else (100, 220, 100))
+            else:
+                msg = ">> PATH CLEAR - Safe to proceed <<"
+                bcol = (0, 255, 100)
 
-except KeyboardInterrupt:
-    print("\n[*] Stopping Smart Cane System...")
+            cv2.putText(frame, msg, (15, imH - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, bcol, 2, cv2.LINE_AA)
 
-# =========================================================
-# ---------------- CLEANUP --------------------------------
-# =========================================================
+            # -----------------------------------------------------
+            # 8. Render Frame / Handle Headless
+            # -----------------------------------------------------
+            if not args.no_show:
+                try:
+                    cv2.imshow('🦯 Smart AI Navigation Cane', frame)
+                    if cv2.waitKey(1) == ord('q'):
+                        break
+                except Exception:
+                    args.no_show = True
 
-print("[+] Cleaning up resources...")
-audio_announcer.speak("Smart cane system shutting down.", force=True)
-time.sleep(0.8)
-audio_announcer.stop()
+            if args.no_show:
+                if alerts:
+                    top = alerts[0]
+                    print(f"\r[ALERT] {top['label'].upper()} in {top['zone']} ({top['proximity']}) | {dist_str} | FPS: {avg_fps:.1f}   ", end="", flush=True)
+                time.sleep(0.01)
 
-videostream.stop()
-cv2.destroyAllWindows()
+    except KeyboardInterrupt:
+        print("\n[*] Stopping Smart Cane System...")
 
-if HAS_RPI_GPIO:
-    GPIO.output(BUZZER, GPIO.LOW)
-    GPIO.cleanup()
+    # =========================================================
+    # ---------------- CLEANUP --------------------------------
+    # =========================================================
 
-print("[✓] System shut down cleanly.")
+    print("[+] Cleaning up resources...")
+    audio_announcer.speak("Smart cane system shutting down.", force=True)
+    time.sleep(0.8)
+    audio_announcer.stop()
+
+    videostream.stop()
+    cv2.destroyAllWindows()
+
+    if HAS_RPI_GPIO:
+        try:
+            GPIO.output(BUZZER, GPIO.LOW)
+            GPIO.cleanup()
+        except Exception:
+            pass
+
+    print("[✓] System shut down cleanly.")
+
+
+if __name__ == '__main__':
+    main()
