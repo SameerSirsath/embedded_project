@@ -83,16 +83,21 @@ class VoiceAlertWorker:
             if self._tts_engine is not None:
                 self._tts_engine.say(text)
                 self._tts_engine.runAndWait()
-            else:
+            elif os.name == 'nt':
                 # Fallback to Windows native PowerShell speech synthesizer
                 import subprocess
                 cmd = f"Add-Type -AssemblyName System.speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{text}');"
                 subprocess.run(
                     ["powershell", "-NoProfile", "-Command", cmd],
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
                     timeout=3.0
                 )
+            else:
+                # Fallback to Linux / Raspberry Pi OS speech synthesizer (espeak-ng)
+                import subprocess
+                subprocess.run(["espeak-ng", text], stderr=subprocess.DEVNULL, timeout=3.0)
         except Exception:
+            pass
             pass
 
 
