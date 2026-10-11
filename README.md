@@ -22,12 +22,20 @@ embedded_project/
 │   ├── obstacle_yolo_best.onnx      # Exported ONNX model for embedded/edge deployment
 │   └── classes.json                 # Target classes and metadata
 ├── requirements.txt                 # Project dependencies
+├── setup_rpi.sh                     # Automated Raspberry Pi 5 installation script
 ├── train_obstacle_detector.ipynb    # Complete training & model export notebook
 ├── test_obstacle_detector.ipynb     # Interactive testing notebook in PyCharm
 ├── test_obstacle_detector.py        # Standalone Python inference script (webcam, video, images)
 ├── live_camera_detection.py         # Dedicated live camera detection script (interactive HUD & voice)
+├── live_audio_obstacle_detector.py  # Standalone Bluetooth speaker audio testing
+├── smart_ai_cane.py                 # MASTER unified system (Vision + Audio + GPIO + GPS + Telegram)
+├── PROJECT_SPECIFICATION.md         # Comprehensive hardware & software technical specification
 └── README.md                        # Documentation & setup guide
 ```
+
+> [!TIP]
+> 📖 **Full Hardware & Software Specification**: For the complete pinout connections, circuit diagrams, flowchart, edge inference benchmarks, and system walkthrough, refer to [PROJECT_SPECIFICATION.md](PROJECT_SPECIFICATION.md).
+
 
 ---
 
