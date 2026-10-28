@@ -1,0 +1,984 @@
+================================================================================
+  SECTION 1  —  PROJECT STRUCTURE
+================================================================================
+
+your_project/
+├── smart_ai_cane.py                    # EXISTING (edit ~25 lines - see §4)
+├── smart_cane_reader_implementation.txt  <-- this file
+├── requirements.txt                    # NEW (see §2)
+│
+├── smart_cane/                         # NEW package
+│   ├── __init__.py
+│   ├── config.py
+│   ├── main.py
+│   │
+│   ├── core/
+│   │   ├── __init__.py
+│   │   └── mode_manager.py
+│   │
+│   ├── hardware/
+│   │   ├── __init__.py
+│   │   ├── camera.py
+│   │   └── button.py
+│   │
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── audio.py
+│   │   ├── bookmarks.py
+│   │   └── ocr_reader.py
+│   │
+│   └── utils/
+│       └── __init__.py
+│
+└── tests/
+    ├── __init__.py
+    ├── test_ocr_reader.py
+    ├── manual_read_test.py
+    └── manual_button_test.py
+
+================================================================================
+  SECTION 2  —  INSTALLATION
+================================================================================
+
+# System packages (run once)
+sudo apt update
+sudo apt install -y espeak-ng tesseract-ocr libtesseract-dev \
+                    libopenblas-dev libatlas-base-dev portaudio19-dev \
+                    python3-opencv
+
+# Python packages (inside your venv, if you use one)
+pip install rapidocr-onnxruntime pytesseract pyttsx3 gpiozero \
+            opencv-python pillow numpy pytest
+
+--------------------------------------------------------------------------------
+  requirements.txt (NEW FILE)
+--------------------------------------------------------------------------------
+    rapidocr-onnxruntime>=1.3.0
+    pytesseract>=0.3.10
+    pyttsx3>=2.90
+    gpiozero>=2.0
+    opencv-python>=4.8
+    pillow>=10.0
+    numpy>=1.24
+    pytest>=7.4
+
+  Note: On first RapidOCR call, ~15 MB of ONNX models auto-download to
+  ~/.cache/. First OCR ~20 s, subsequent calls ~1 s.
+
+================================================================================
+  SECTION 3  —  COMPLETE CODE
+================================================================================
+
+--------------------------------------------------------------------------------
+  FILE:  smart_cane/__init__.py
+--------------------------------------------------------------------------------
+    """Smart cane reader subsystem."""
+    __version__ = "1.0.0"
+
+--------------------------------------------------------------------------------
+  FILE:  smart_cane/core/__init__.py
+--------------------------------------------------------------------------------
+    # package marker
+
+--------------------------------------------------------------------------------
+  FILE:  smart_cane/hardware/__init__.py
+--------------------------------------------------------------------------------
+    # package marker
+
+--------------------------------------------------------------------------------
+  FILE:  smart_cane/services/__init__.py
+--------------------------------------------------------------------------------
+    # package marker
+
+--------------------------------------------------------------------------------
+  FILE:  smart_cane/utils/__init__.py
+--------------------------------------------------------------------------------
+    # package marker
+
+--------------------------------------------------------------------------------
+  FILE:  tests/__init__.py
+--------------------------------------------------------------------------------
+    # package marker
+
+
+--------------------------------------------------------------------------------
+  FILE:  smart_cane/config.py
+--------------------------------------------------------------------------------
+    import os
+
+
+    class Config:
+        # --- Camera -------------------------------------------------
+        CAMERA_INDEX   = int(os.getenv("SC_CAMERA_INDEX", "0"))
+        CAMERA_WIDTH   = 1280
+        CAMERA_HEIGHT  = 720
+
+        # --- OCR ----------------------------------------------------
+        OCR_ENGINE      = os.getenv("SC_OCR_ENGINE", "rapidocr")  # rapidocr | tesseract
+        OCR_MODE        = os.getenv("SC_OCR_MODE", "book")        # book | screen
+        OCR_BURST_FRAMES = 3
+        OCR_BURST_DELAY  = 0.15
+
+        # --- TTS ----------------------------------------------------
+        TTS_RATE  = 170
+        TTS_VOICE = None   # substring of voice name, e.g. "english"
+
+        # --- Button (BCM pin number) --------------------------------
+        BUTTON_PIN            = int(os.getenv("SC_BUTTON_PIN", "17"))
+        BUTTON_LONG_PRESS_SEC = 1.5
+        BUTTON_DOUBLE_GAP     = 0.4
+
+        # --- Bookmarks ----------------------------------------------
+        BOOKMARKS_PATH = os.getenv("SC_BOOKMARKS_PATH",
+                                   "~/.smart_cane_bookmarks.json")
+
+        # --- FPS modes ----------------------------------------------
+        NAV_FPS     = 15
+        READING_FPS = 2
+
+
+--------------------------------------------------------------------------------
+  FILE:  smart_cane/hardware/camera.py
+--------------------------------------------------------------------------------
+    import numpy as np
+
+
+    class OpenCVCamera:
+        def __init__(self, index=0, width=1280, height=720):
+            import cv2
+            self.cap = cv2.VideoCapture(index)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            if not self.cap.isOpened():
+                raise RuntimeError(f"Camera {index} not available")
+
+        def capture(self) -> np.ndarray:
+            ok, frame = self.cap.read()
+            if not ok:
+                raise RuntimeError("Camera capture failed")
+            return frame
+
+        def release(self):
+            self.cap.release()
+
+
+    class PiCamera2Capture:
+        def __init__(self, width=1280, height=720):
+            from picamera2 import Picamera2
+            self.picam = Picamera2()
+            cfg = self.picam.create_preview_configuration(
+                main={"size": (width, height), "format": "RGB888"}
+            )
+            self.picam.configure(cfg)
+            self.picam.start()
+
+        def capture(self) -> np.ndarray:
+            import cv2
+            rgb = self.picam.capture_array()
+            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+        def release(self):
+            self.picam.stop()
+
+
+--------------------------------------------------------------------------------
+  FILE:  smart_cane/services/audio.py
+--------------------------------------------------------------------------------
+    import queue
+    import re
+    import threading
+
+
+    class ReadingTTS:
+        """Threaded TTS with pause / resume / stop + alert ducking."""
+
+        def __init__(self, rate=170, voice=None):
+            import pyttsx3
+            self.engine = pyttsx3.init()
+            self.engine.setProperty("rate", rate)
+            if voice:
+                for v in self.engine.getProperty("voices"):
+                    if voice.lower() in v.name.lower():
+                        self.engine.setProperty("voice", v.id)
+                        break
+            self.q        = queue.Queue()
+            self.paused   = threading.Event()
+            self.stopped  = threading.Event()
+            self._current = None
+            self._worker  = threading.Thread(target=self._run, daemon=True)
+            self._worker.start()
+
+        # --------- public API ---------------------------------------
+        def speak(self, text, interrupt=False):
+            if interrupt:
+                self.stop()
+                self.stopped.clear()
+            for sent in self.split(text):
+                self.q.put(sent)
+
+        def pause(self):
+            self.paused.set()
+
+        def resume(self):
+            self.paused.clear()
+
+        def stop(self):
+            self.stopped.set()
+            with self.q.mutex:
+                self.q.queue.clear()
+            self._current = None
+
+        def alert(self, message):
+            """Duck reading, speak alert, resume."""
+            was_paused = self.paused.is_set()
+            self.paused.set()
+            try:
+                self.engine.say(message)
+                self.engine.runAndWait()
+            finally:
+                if not was_paused:
+                    self.paused.clear()
+
+        @staticmethod
+        def split(text):
+            text = re.sub(r"\s+", " ", text).strip()
+            return [s for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+
+        # --------- worker -------------------------------------------
+        def _run(self):
+            while not self.stopped.is_set():
+                try:
+                    sent = self.q.get(timeout=0.2)
+                except queue.Empty:
+                    self._current = None
+                    continue
+                while self.paused.is_set() and not self.stopped.is_set():
+                    self.paused.wait(0.1)
+                if self.stopped.is_set():
+                    break
+                self._current = sent
+                try:
+                    self.engine.say(sent)
+                    self.engine.runAndWait()
+                except Exception as e:
+                    print(f"[TTS] error: {e}")
+                self._current = None
+
+
+--------------------------------------------------------------------------------
+  FILE:  smart_cane/services/bookmarks.py
+--------------------------------------------------------------------------------
+    import hashlib
+    import json
+    import os
+    import time
+
+    import cv2
+
+
+    class BookmarkStore:
+        def __init__(self, path="~/.smart_cane_bookmarks.json"):
+            self.path = os.path.expanduser(path)
+            self.data = {}
+            self._load()
+
+        def _load(self):
+            if os.path.exists(self.path):
+                try:
+                    with open(self.path) as f:
+                        self.data = json.load(f)
+                except Exception:
+                    self.data = {}
+
+        def _save(self):
+            try:
+                with open(self.path, "w") as f:
+                    json.dump(self.data, f, indent=2)
+            except Exception as e:
+                print(f"[bookmarks] save failed: {e}")
+
+        @staticmethod
+        def page_hash(img):
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) \
+                   if img.ndim == 3 else img
+            small = cv2.resize(gray, (16, 16),
+                               interpolation=cv2.INTER_AREA)
+            return hashlib.md5(small.tobytes()).hexdigest()
+
+        def save(self, page_hash, sentence_index, book_id="default"):
+            self.data[book_id] = {
+                "page_hash":      page_hash,
+                "sentence_index": int(sentence_index),
+                "timestamp":      time.time(),
+            }
+            self._save()
+
+        def resume(self, page_hash, book_id="default"):
+            entry = self.data.get(book_id)
+            if entry and entry.get("page_hash") == page_hash:
+                return int(entry.get("sentence_index", 0))
+            return 0
+
+
+--------------------------------------------------------------------------------
+  FILE:  smart_cane/services/ocr_reader.py
+--------------------------------------------------------------------------------
+    import time
+
+    import cv2
+    import numpy as np
+
+
+    # --------- pure helpers (unit-testable) --------------------------
+    def sharpest_of(frames):
+        """Return (frame, focus_score) with max Laplacian variance."""
+        best, best_score = frames[0], -1.0
+        for f in frames:
+            gray  = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+            score = cv2.Laplacian(gray, cv2.CV_64F).var()
+            if score > best_score:
+                best, best_score = f, score
+        return best, best_score
+
+
+    def preprocess(img, mode="book"):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if mode == "screen":
+            gray = cv2.bilateralFilter(gray, 7, 50, 50)
+            gray = cv2.createCLAHE(clipLimit=2.0,
+                                   tileGridSize=(8, 8)).apply(gray)
+            thresh = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 31, 10,
+            )
+        else:
+            gray = cv2.createCLAHE(clipLimit=3.0,
+                                   tileGridSize=(8, 8)).apply(gray)
+            blur = cv2.GaussianBlur(gray, (5, 5), 0)
+            thresh = cv2.adaptiveThreshold(
+                blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 25, 15,
+            )
+            thresh = cv2.resize(thresh, None, fx=1.5, fy=1.5,
+                                interpolation=cv2.INTER_CUBIC)
+        return thresh
+
+
+    def _largest_gap(xs_sorted):
+        if len(xs_sorted) < 2:
+            return None
+        gaps = [(xs_sorted[i], xs_sorted[i + 1])
+                for i in range(len(xs_sorted) - 1)]
+        return max(gaps, key=lambda g: g[1] - g[0])
+
+
+    def _join_lines(lines):
+        out = ""
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            if out.endswith("-"):
+                out = out[:-1] + line
+            else:
+                out += " " + line
+        return out.strip()
+
+
+    def order_blocks(blocks, img_shape):
+        """Sort OCR blocks into human reading order; handles 1/2 columns."""
+        H, W = img_shape[:2]
+        blocks = [b for b in blocks
+                  if b["conf"] > 0.6 and len(b["text"].strip()) > 1]
+        blocks = [b for b in blocks
+                  if 0.06 * H < b["bbox"][1] < 0.94 * H]
+        if not blocks:
+            return ""
+        xs  = sorted(b["bbox"][0] for b in blocks)
+        gap = _largest_gap(xs)
+        if gap and (gap[1] - gap[0]) > 0.15 * W:
+            mid   = (gap[0] + gap[1]) / 2.0
+            left  = sorted([b for b in blocks if b["bbox"][0] <  mid],
+                           key=lambda b: b["bbox"][1])
+            right = sorted([b for b in blocks if b["bbox"][0] >= mid],
+                           key=lambda b: b["bbox"][1])
+            ordered = left + right
+        else:
+            ordered = sorted(blocks,
+                             key=lambda b: (b["bbox"][1] // 20, b["bbox"][0]))
+        return _join_lines([b["text"] for b in ordered])
+
+
+    # --------- main reader class -------------------------------------
+    class PageReader:
+        def __init__(self, capture_fn, engine="rapidocr", mode="book",
+                     burst_frames=3, burst_delay=0.15):
+            self.capture_fn   = capture_fn
+            self.mode         = mode
+            self.burst_frames = burst_frames
+            self.burst_delay  = burst_delay
+            self.bookmarks    = None
+            self._ocr         = self._init_engine(engine)
+
+        @staticmethod
+        def _init_engine(engine):
+            if engine == "rapidocr":
+                try:
+                    from rapidocr_onnxruntime import RapidOCR
+                    return RapidOCR()
+                except ImportError:
+                    print("[OCR] rapidocr missing; falling back to tesseract")
+            import pytesseract
+            return pytesseract
+
+        def grab(self):
+            frames = []
+            for _ in range(self.burst_frames):
+                frames.append(self.capture_fn())
+                time.sleep(self.burst_delay)
+            best, _ = sharpest_of(frames)
+            return best
+
+        def _rapidocr_blocks(self, img):
+            result, _ = self._ocr(img)
+            if not result:
+                return []
+            blocks = []
+            for box, text, conf in result:
+                xs = [p[0] for p in box]
+                ys = [p[1] for p in box]
+                blocks.append({
+                    "text": text,
+                    "bbox": [min(xs), min(ys),
+                             max(xs) - min(xs), max(ys) - min(ys)],
+                    "conf": float(conf),
+                })
+            return blocks
+
+        def extract_text(self, img):
+            proc = preprocess(img, mode=self.mode)
+            if hasattr(self._ocr, "process"):
+                return order_blocks(self._rapidocr_blocks(proc), proc.shape)
+            return self._ocr.image_to_string(proc)
+
+        @staticmethod
+        def page_hash(img):
+            from .bookmarks import BookmarkStore
+            return BookmarkStore.page_hash(img)
+
+
+--------------------------------------------------------------------------------
+  FILE:  smart_cane/hardware/button.py
+--------------------------------------------------------------------------------
+    import threading
+    import time
+
+
+    class ButtonController:
+        """Single / double / triple / long-press dispatcher."""
+
+        def __init__(self, pin=17, on_single=None, on_double=None,
+                     on_triple=None, on_long=None,
+                     long_press_sec=1.5, double_gap=0.4):
+            self.on_single = on_single
+            self.on_double = on_double
+            self.on_triple = on_triple
+            self.on_long   = on_long
+            self.long_press_sec = long_press_sec
+            self.double_gap     = double_gap
+            self._count       = 0
+            self._press_start = 0.0
+            self._timer       = None
+            self._lock        = threading.Lock()
+
+            try:
+                from gpiozero import Button
+                self.btn = Button(pin, pull_up=True, bounce_time=0.05)
+                self.btn.when_pressed  = self._on_press
+                self.btn.when_released = self._on_release
+            except Exception as e:
+                self.btn = None
+                print(f"[button] GPIO unavailable ({e}); "
+                      f"use .trigger() for testing")
+
+        def _on_press(self):
+            self._press_start = time.time()
+            with self._lock:
+                self._count += 1
+
+        def _on_release(self):
+            held = time.time() - self._press_start
+            if held >= self.long_press_sec:
+                with self._lock:
+                    self._count = 0
+                self._fire(self.on_long)
+                return
+            if self._timer is None or not self._timer.is_alive():
+                self._timer = threading.Timer(self.double_gap,
+                                              self._resolve)
+                self._timer.start()
+
+        def _resolve(self):
+            with self._lock:
+                n, self._count = self._count, 0
+            if   n == 1: self._fire(self.on_single)
+            elif n == 2: self._fire(self.on_double)
+            elif n >= 3: self._fire(self.on_triple)
+
+        @staticmethod
+        def _fire(cb):
+            if cb:
+                try:
+                    cb()
+                except Exception as e:
+                    print(f"[button] callback error: {e}")
+
+        def trigger(self, n=1):
+            """Manual trigger for testing without GPIO."""
+            with self._lock:
+                self._count = n
+            self._resolve()
+
+
+--------------------------------------------------------------------------------
+  FILE:  smart_cane/core/mode_manager.py
+--------------------------------------------------------------------------------
+    import threading
+
+    from ..config import Config
+
+
+    class ModeManager:
+        def __init__(self, page_reader, tts, button,
+                     detector_controller=None):
+            self.reader   = page_reader
+            self.tts      = tts
+            self.button   = button
+            self.detector = detector_controller
+            self.mode     = "navigation"
+            self._page_hash = None
+
+        def start(self):
+            self.button.on_single = self._on_single
+            self.button.on_double = self._on_double
+            self.button.on_triple = self._on_triple
+            self.button.on_long   = self._on_long
+
+        # --------- handlers -----------------------------------------
+        def _on_single(self):
+            if self.mode == "navigation":
+                self._enter_reading()
+            else:
+                if self.tts.paused.is_set():
+                    self.tts.resume()
+                    self.tts.speak("Resuming.")
+                else:
+                    self.tts.pause()
+                    self.tts.speak("Paused.")
+
+        def _on_double(self):
+            if self.mode == "reading":
+                self.tts.stop()
+                self.tts.speak("Stopped.")
+
+        def _on_triple(self):
+            if self.mode == "reading":
+                self._read_page()
+
+        def _on_long(self):
+            if self.mode == "reading":
+                self._exit_reading()
+
+        # --------- transitions --------------------------------------
+        def _enter_reading(self):
+            self.mode = "reading"
+            if self.detector:
+                self.detector.set_fps(Config.READING_FPS)
+            self.tts.speak(
+                "Reading mode. Press once to read, twice to stop, "
+                "triple to read next page, hold to exit."
+            )
+            threading.Timer(3.0, self._read_page).start()
+
+        def _exit_reading(self):
+            self.tts.stop()
+            self.tts.speak("Navigation mode.")
+            self.mode = "navigation"
+            if self.detector:
+                self.detector.set_fps(Config.NAV_FPS)
+
+        # --------- reading ------------------------------------------
+        def _read_page(self):
+            if self.mode != "reading":
+                return
+            try:
+                img = self.reader.grab()
+            except Exception as e:
+                print(f"[ModeManager] capture error: {e}")
+                self.tts.speak("I couldn't capture the page. Try again.")
+                return
+            try:
+                text = self.reader.extract_text(img)
+            except Exception as e:
+                print(f"[ModeManager] ocr error: {e}")
+                self.tts.speak("OCR failed. More light, or hold still.")
+                return
+            if not text.strip():
+                self.tts.speak("I couldn't find any text on that page.")
+                return
+
+            self._page_hash = self.reader.page_hash(img)
+            sentences       = self.tts.split(text)
+            start = 0
+            if self.reader.bookmarks:
+                start = self.reader.bookmarks.resume(self._page_hash)
+            if 0 < start < len(sentences):
+                self.tts.speak(f"Resuming from sentence {start + 1}.")
+            for i in range(start, len(sentences)):
+                self.tts.q.put(sentences[i])
+                if self.reader.bookmarks:
+                    self.reader.bookmarks.save(self._page_hash, i + 1)
+
+
+--------------------------------------------------------------------------------
+  FILE:  smart_cane/main.py
+--------------------------------------------------------------------------------
+    from .config import Config
+    from .core.mode_manager import ModeManager
+    from .hardware.button import ButtonController
+    from .hardware.camera import OpenCVCamera, PiCamera2Capture
+    from .services.audio import ReadingTTS
+    from .services.bookmarks import BookmarkStore
+    from .services.ocr_reader import PageReader
+
+
+    def make_camera():
+        try:
+            return PiCamera2Capture(Config.CAMERA_WIDTH,
+                                    Config.CAMERA_HEIGHT)
+        except Exception:
+            return OpenCVCamera(Config.CAMERA_INDEX,
+                                Config.CAMERA_WIDTH,
+                                Config.CAMERA_HEIGHT)
+
+
+    def init_reader_subsystem(detector_controller=None):
+        """
+        Call once from smart_ai_cane.py at startup.
+        Returns (mode_manager, tts).
+        """
+        cam = make_camera()
+        tts = ReadingTTS(rate=Config.TTS_RATE, voice=Config.TTS_VOICE)
+
+        bookmarks       = BookmarkStore(Config.BOOKMARKS_PATH)
+        reader          = PageReader(
+            capture_fn   = cam.capture,
+            engine       = Config.OCR_ENGINE,
+            mode         = Config.OCR_MODE,
+            burst_frames = Config.OCR_BURST_FRAMES,
+            burst_delay  = Config.OCR_BURST_DELAY,
+        )
+        reader.bookmarks = bookmarks
+
+        button = ButtonController(
+            pin            = Config.BUTTON_PIN,
+            long_press_sec = Config.BUTTON_LONG_PRESS_SEC,
+            double_gap     = Config.BUTTON_DOUBLE_GAP,
+        )
+
+        manager = ModeManager(reader, tts, button, detector_controller)
+        manager.start()
+        tts.speak("Smart cane ready.")
+        return manager, tts
+
+
+--------------------------------------------------------------------------------
+  FILE:  tests/test_ocr_reader.py
+--------------------------------------------------------------------------------
+    import cv2
+    import numpy as np
+
+    from smart_cane.services.ocr_reader import (
+        sharpest_of, preprocess, order_blocks, _join_lines,
+    )
+    from smart_cane.services.bookmarks import BookmarkStore
+
+
+    def test_sharpest_of_picks_blurry_vs_sharp():
+        sharp  = np.random.randint(0, 255, (200, 200, 3), dtype=np.uint8)
+        blurry = cv2.GaussianBlur(sharp, (31, 31), 0)
+        best, _ = sharpest_of([blurry, sharp])
+        assert best is sharp
+
+
+    def test_preprocess_returns_binary_image():
+        img = np.full((100, 100, 3), 128, dtype=np.uint8)
+        out = preprocess(img, mode="book")
+        assert out.ndim == 2
+        assert set(np.unique(out)).issubset({0, 255})
+
+
+    def test_join_lines_dehyphenates():
+        assert _join_lines(["obsta-", "cle ahead"]) == "obstacle ahead"
+
+
+    def test_order_blocks_single_column():
+        H, W = 500, 400
+        blocks = [
+            {"text": "Second line", "bbox": [50, 200, 200, 30], "conf": 0.9},
+            {"text": "First line",  "bbox": [50, 100, 200, 30], "conf": 0.9},
+        ]
+        text = order_blocks(blocks, (H, W, 3))
+        assert text.startswith("First line")
+
+
+    def test_page_hash_stable_for_identical_frames():
+        a = np.zeros((100, 100, 3), dtype=np.uint8)
+        b = a.copy()
+        assert BookmarkStore.page_hash(a) == BookmarkStore.page_hash(b)
+
+
+--------------------------------------------------------------------------------
+  FILE:  tests/manual_read_test.py
+--------------------------------------------------------------------------------
+    """End-to-end OCR+TTS test without GPIO."""
+    import time
+
+    from smart_cane.hardware.camera import OpenCVCamera
+    from smart_cane.services.audio   import ReadingTTS
+    from smart_cane.services.ocr_reader import PageReader
+
+
+    cam    = OpenCVCamera(0, 1280, 720)
+    tts    = ReadingTTS(rate=170)
+    reader = PageReader(capture_fn=cam.capture, engine="rapidocr",
+                        mode="book")
+
+    print("Hold a page in front of the camera. Reading in 3 s...")
+    time.sleep(3)
+
+    img  = reader.grab()
+    text = reader.extract_text(img)
+    print(f"\n--- Extracted ({len(text)} chars) ---\n{text[:500]}\n")
+
+    if text.strip():
+        tts.speak(text)
+
+
+--------------------------------------------------------------------------------
+  FILE:  tests/manual_button_test.py
+--------------------------------------------------------------------------------
+    import time
+
+    from smart_cane.hardware.button import ButtonController
+    from smart_cane.config import Config
+
+
+    def say(msg):
+        print(f"→ {msg}")
+
+
+    ButtonController(
+        pin       = Config.BUTTON_PIN,
+        on_single = lambda: say("SINGLE"),
+        on_double = lambda: say("DOUBLE"),
+        on_triple = lambda: say("TRIPLE"),
+        on_long   = lambda: say("LONG"),
+    )
+    print(f"Listening on GPIO {Config.BUTTON_PIN}. Ctrl+C to quit.")
+    while True:
+        time.sleep(1)
+
+
+================================================================================
+  SECTION 4  —  INTEGRATION INTO EXISTING smart_ai_cane.py
+================================================================================
+
+You only need THREE small edits. No rewrite.
+
+--------------------------------------------------------------------------------
+  EDIT 1 — add imports + DetectorController at top of smart_ai_cane.py
+--------------------------------------------------------------------------------
+    import threading
+    from smart_cane.main import init_reader_subsystem
+
+
+    class DetectorController:
+        """Lets reader slow YOLO to 2 FPS + routes alerts through TTS."""
+        def __init__(self, tts=None):
+            self.tts = tts
+            self.target_fps = 15
+            self._lock = threading.Lock()
+
+        def set_fps(self, n):
+            with self._lock:
+                self.target_fps = n
+
+        def frame_delay(self):
+            with self._lock:
+                return 1.0 / max(self.target_fps, 1)
+
+        def send_alert(self, message):
+            """Call this INSTEAD of direct beep/TTS for obstacle alerts."""
+            if self.tts:
+                self.tts.alert(message)
+
+
+--------------------------------------------------------------------------------
+  EDIT 2 — bootstrap reader subsystem in __main__
+--------------------------------------------------------------------------------
+    # Replace your existing "if __name__ == '__main__':" block with:
+
+    if __name__ == "__main__":
+        # 1) bootstrap reading subsystem (mutes until tts wired)
+        detector = DetectorController(tts=None)
+        manager, tts = init_reader_subsystem(detector_controller=detector)
+        detector.tts = tts
+
+        # 2) ...your existing setup...
+        #    (camera, YOLO model, GPIO, ultrasonic, Telegram)
+
+        # 3) your existing main while-loop, unchanged, EXCEPT:
+
+        while True:
+            # ... existing YOLO + ultrasonic logic ...
+
+            # OLD:  play_beep()  or  speak("Obstacle ahead")
+            # NEW:
+            if obstacle_detected:
+                detector.send_alert("Obstacle ahead.")
+
+            # OLD:  time.sleep(0.1)
+            # NEW:
+            time.sleep(detector.frame_delay())
+
+
+--------------------------------------------------------------------------------
+  EDIT 3 — secure Telegram creds (while you're in the file)
+--------------------------------------------------------------------------------
+    # OLD:
+    BOT_TOKEN = "123:ABC..."
+    CHAT_ID   = "12345678"
+
+    # NEW:
+    import os
+    BOT_TOKEN = os.getenv("SC_BOT_TOKEN")
+    CHAT_ID   = os.getenv("SC_CHAT_ID")
+
+    # Then export before running:
+    #   export SC_BOT_TOKEN=...
+    #   export SC_CHAT_ID=...
+
+================================================================================
+  SECTION 5  —  QUICK START (5 STEPS)
+================================================================================
+
+  STEP 1  Create the folder tree from §1 and paste each file from §3.
+
+  STEP 2  Install dependencies (§2):
+              sudo apt install -y espeak-ng tesseract-ocr ...
+              pip install -r requirements.txt
+
+  STEP 3  Verify the OCR+TTS pipeline standalone (no GPIO):
+              python -m tests.manual_read_test
+          Expect: text printed to console + speaker reads it aloud.
+
+  STEP 4  Run unit tests:
+              pytest -v tests/test_ocr_reader.py
+
+  STEP 5  Wire into the cane:
+              - Apply EDIT 1, 2, 3 from §4 to smart_ai_cane.py
+              - export SC_BOT_TOKEN=...   (and SC_CHAT_ID)
+              - python smart_ai_cane.py
+
+  EXPECTED RUNTIME BEHAVIOUR
+  --------------------------------------------------------------------------
+    Startup         :  "Smart cane ready."
+    Obstacle        :  "Obstacle ahead."  (reading audio auto-ducks)
+    Press button    :  "Reading mode…"  → 3 s later reads the page
+    Single while rd :  Pause / Resume
+    Double while rd :  Stop reading
+    Triple while rd :  Read the next page
+    Long-press      :  Back to navigation mode
+
+  BUTTON MAP
+  --------------------------------------------------------------------------
+    Single press   → enter reading   /   pause-resume
+    Double press   → stop reading
+    Triple press   → next page
+    Long press     → exit to navigation
+
+  SAFETY NOTE
+  --------------------------------------------------------------------------
+    During reading mode, YOLO continues at 1-2 FPS so obstacle alerts still
+    fire. Use bone-conduction or open-ear headphones so that reading audio
+    never fully masks ambient sound.
+
+================================================================================
+  SECTION 6  —  TROUBLESHOOTING
+================================================================================
+
+  Symptom                          | Fix
+  ---------------------------------+--------------------------------------------
+  pyttsx3 hangs on Pi              | sudo apt install espeak-ng; if still
+                                   | hangs, swap worker to
+                                   | subprocess.run(["espeak-ng", sent])
+  ---------------------------------+--------------------------------------------
+  RapidOCR first run slow          | Normal — models cache to ~/.cache/.
+                                   | Subsequent calls ~1 s.
+  ---------------------------------+--------------------------------------------
+  Poor OCR accuracy                | Set SC_OCR_MODE=screen for laptop/PDF.
+                                   | For books add an LED ring. Save
+                                   | preprocessed image to /tmp/ to inspect.
+  ---------------------------------+--------------------------------------------
+  Camera green image (PiCam)       | PiCamera2Capture converts RGB→BGR.
+                                   | Auto-fallback to OpenCV if picamera2
+                                   | unavailable.
+  ---------------------------------+--------------------------------------------
+  Button unresponsive              | Ensure user is in gpio group. Default
+                                   | pin 17 (BCM). Change via
+                                   | SC_BUTTON_PIN env var.
+  ---------------------------------+--------------------------------------------
+  Bookmark resumes at wrong place  | Page hash is exact md5. For fuzzy
+                                   | match, swap BookmarkStore.page_hash
+                                   | for imagehash.phash (pip install
+                                   | imagehash).
+  ---------------------------------+--------------------------------------------
+  Reading audio overlaps obstacles | Ensure obstacle code calls
+                                   | detector.send_alert() — NOT direct
+                                   | engine.say().
+  ---------------------------------+--------------------------------------------
+  Multiple read triggers on 1 press| Increase Config.BUTTON_DOUBLE_GAP to
+                                   | 0.6.
+
+================================================================================
+  SECTION 7  —  OPTIONAL POLISH (add later)
+================================================================================
+
+  1.  Piper TTS — richer voice:
+          pip install piper-tts
+      Replace ReadingTTS.engine with a Piper subprocess; call syntax
+      identical, so ModeManager code stays unchanged.
+
+  2.  Auto page-turn detection:
+      In ModeManager._read_page, keep self._prev_hash; if the new
+      page_hash differs and text is empty, say:
+          "New page detected. Press triple to read."
+
+  3.  Dewarping for curved book pages:
+          pip install page-dewarp
+      Call page_dewarp on the raw image BEFORE preprocess() in book mode.
+
+  4.  Voice commands (wake-word):
+          pip install openwakeword
+      Trigger ModeManager._on_single / _on_triple / _on_long from the
+      wake-word callback.
+
+  5.  PDF / laptop screen mode:
+      Set SC_OCR_MODE=screen in env; same pipeline, tuned preprocessing.
+      For PDFs: pdftoppm -r 200 page.pdf /tmp/pg && feed PNG to
+      PageReader.extract_text directly (skip camera).
+
+================================================================================
+  END OF FILE
+================================================================================

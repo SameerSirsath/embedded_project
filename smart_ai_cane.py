@@ -28,6 +28,30 @@ import numpy as np
 import requests
 from ultralytics import YOLO
 
+# Smart Cane Reader Subsystem integration
+from smart_cane.main import init_reader_subsystem
+
+
+class DetectorController:
+    """Lets reader slow YOLO to 2 FPS + routes alerts through TTS."""
+    def __init__(self, tts=None):
+        self.tts = tts
+        self.target_fps = 15
+        self._lock = threading.Lock()
+
+    def set_fps(self, n):
+        with self._lock:
+            self.target_fps = n
+
+    def frame_delay(self):
+        with self._lock:
+            return 1.0 / max(self.target_fps, 1)
+
+    def send_alert(self, message):
+        """Call this INSTEAD of direct beep/TTS for obstacle alerts."""
+        if self.tts:
+            self.tts.alert(message)
+
 # Safe GPS library import
 try:
     import serial
@@ -50,8 +74,8 @@ except Exception:
 # ---------------- TELEGRAM SETTINGS ----------------------
 # =========================================================
 
-BOT_TOKEN = "8781158016:AAEw_jaSW7kqGpDOIJPd9A9d98CcEzT254I"
-CHAT_ID = "6019364300"
+BOT_TOKEN = os.getenv("SC_BOT_TOKEN", "8781158016:AAEw_jaSW7kqGpDOIJPd9A9d98CcEzT254I")
+CHAT_ID = os.getenv("SC_CHAT_ID", "6019364300")
 
 
 # =========================================================
@@ -444,9 +468,19 @@ def main():
     print(" 🦯 SMART AI NAVIGATION CANE - SYSTEM STARTING")
     print("=" * 65)
 
-    # 1. Initialize Audio Engine
+    # 1. Bootstrap Reading Subsystem & Detector Controller
+    detector = DetectorController(tts=None)
+    try:
+        manager, tts = init_reader_subsystem(detector_controller=detector)
+        detector.tts = tts
+    except Exception as e:
+        print(f"[!] Reader subsystem init note: {e}")
+        manager, tts = None, None
+
+    # Auxiliary / Fallback Audio Engine
     audio_announcer = AsyncAudioAnnouncer(cooldown=3.0)
-    audio_announcer.speak("Smart AI Cane active. Audio connected.", force=True)
+    if not (detector and detector.tts):
+        audio_announcer.speak("Smart AI Cane active. Audio connected.", force=True)
 
     # 2. Load YOLO Model
     model_file = resolve_model_path(args.weights)
@@ -515,7 +549,11 @@ def main():
 
                 current_time = time.time()
                 if (current_time - last_ultrasonic_speech) > 4.0:
-                    audio_announcer.speak(f"Stop! Obstacle very close at {int(distance)} centimeters!", force=True)
+                    alert_msg = f"Stop! Obstacle very close at {int(distance)} centimeters!"
+                    if detector and detector.tts:
+                        detector.send_alert(alert_msg)
+                    else:
+                        audio_announcer.speak(alert_msg, force=True)
                     last_ultrasonic_speech = current_time
             else:
                 if HAS_RPI_GPIO:
@@ -542,7 +580,10 @@ def main():
                 top_hazard = alerts[0]
                 if top_hazard["urgency"] >= 2:  # Warning or Critical
                     voice_msg = generate_voice_alert(top_hazard)
-                    audio_announcer.speak(voice_msg)
+                    if detector and detector.tts:
+                        detector.send_alert(voice_msg)
+                    else:
+                        audio_announcer.speak(voice_msg)
 
             # -----------------------------------------------------
             # 6. FPS Calculation
@@ -615,7 +656,9 @@ def main():
                 if alerts:
                     top = alerts[0]
                     print(f"\r[ALERT] {top['label'].upper()} in {top['zone']} ({top['proximity']}) | {dist_str} | FPS: {avg_fps:.1f}   ", end="", flush=True)
-                time.sleep(0.01)
+
+            # Regulate frame rate based on mode (15 FPS navigation vs 2 FPS reading)
+            time.sleep(detector.frame_delay())
 
     except KeyboardInterrupt:
         print("\n[*] Stopping Smart Cane System...")
