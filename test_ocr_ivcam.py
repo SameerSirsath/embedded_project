@@ -13,15 +13,16 @@ Features:
   - Burst-Capture Focus Score: Grabs sharpest frame using Laplacian variance
   - Dual Preprocessing Modes: 'book' (printed pages) vs 'screen' (monitors/phones)
   - Natural Reading Order: Multi-column and line sorting
-  - Voice Engine (TTS): Speaks recognized text aloud asynchronously
+  - Robust Multi-Tier TTS Voice Engine: Reads recognized text aloud cleanly on Windows (SAPI) & Linux
   - Interactive Key Controls:
-      [SPACE] / [r] : Run OCR on current view (burst grab & extract)
+      [SPACE] / [r] : Run OCR on current view (burst grab & read aloud)
+      [t]           : Audio Test (Test speaker reading aloud immediately)
       [n]           : Switch Camera (Toggle between iVCam Mobile and Laptop Webcam)
       [m]           : Toggle OCR Mode (Book Mode <-> Screen Mode)
       [p]           : Toggle Preprocessed Binary Image View
       [v]           : Toggle Voice TTS reading aloud
       [s]           : Save Snapshot image & extracted text to runs/ocr_tests/
-      [c]           : Clear current OCR text overlay
+      [c]           : Clear current OCR text overlay & stop speech
       [q] / [ESC]   : Exit test script
 
 Usage:
@@ -36,6 +37,7 @@ import argparse
 import datetime
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -59,62 +61,122 @@ except ImportError:
 
 
 # ==============================================================================
-# 1. Asynchronous Speech Worker (Non-blocking TTS)
+# 1. Asynchronous Speech Worker (Robust Non-blocking TTS for Windows & Linux)
 # ==============================================================================
 class AsyncSpeaker:
-    """Non-blocking TTS worker thread so camera preview never stutters."""
+    """
+    Robust non-blocking TTS worker thread.
+    Uses native Windows SAPI COM (with STA thread initialization) on Windows
+    for 100% reliable, zero-lag, loud audio. Falls back to pyttsx3 or espeak-ng.
+    """
 
     def __init__(self, rate=170, enabled=True):
         self.enabled = enabled
         self.rate = rate
         self.queue = queue.Queue()
-        self.engine = None
         self._stop_event = threading.Event()
-        self._worker_thread = None
-        self._init_engine()
+        self._speaking_event = threading.Event()
+        self._current_sentence = ""
+        self._worker_thread = threading.Thread(target=self._run, daemon=True)
+        self._worker_thread.start()
 
-    def _init_engine(self):
-        try:
-            import pyttsx3
-            self.engine = pyttsx3.init()
-            self.engine.setProperty("rate", self.rate)
-            self._worker_thread = threading.Thread(target=self._run, daemon=True)
-            self._worker_thread.start()
-        except Exception as e:
-            print(f"[!] TTS initialization failed: {e}. Voice alerts disabled.")
-            self.engine = None
+    def is_speaking(self) -> bool:
+        return self._speaking_event.is_set()
+
+    def get_current_sentence(self) -> str:
+        return self._current_sentence
 
     def speak(self, text: str, interrupt: bool = True):
-        if not self.enabled or not self.engine or not text.strip():
+        if not self.enabled or not text.strip():
             return
         if interrupt:
-            # Clear pending speech
-            with self.queue.mutex:
-                self.queue.queue.clear()
-        self.queue.put(text)
+            self.stop()
+        sentences = self.split(text)
+        for s in sentences:
+            self.queue.put(s)
 
     def stop(self):
         with self.queue.mutex:
             self.queue.queue.clear()
-        if self.engine:
-            try:
-                self.engine.stop()
-            except Exception:
-                pass
+        self._current_sentence = ""
+        self._speaking_event.clear()
+
+    @staticmethod
+    def split(text: str):
+        text = re.sub(r"\s+", " ", text).strip()
+        # Split into sentences or clauses for natural rhythm
+        parts = [s.strip() for s in re.split(r"(?<=[.!?\n])\s+", text) if s.strip()]
+        if not parts:
+            return [text]
+        return parts
 
     def _run(self):
+        sapi_voice = None
+        pyttsx_engine = None
+
+        # 1. Initialize Windows SAPI with thread COM initialization
+        if os.name == "nt":
+            try:
+                import pythoncom
+                import win32com.client
+                pythoncom.CoInitialize()
+                sapi_voice = win32com.client.Dispatch("SAPI.SpVoice")
+                sapi_voice.Rate = 1
+                sapi_voice.Volume = 100
+                print("[TTS] Windows SAPI Speech Synthesizer initialized successfully (Volume: 100%).")
+            except Exception as e:
+                print(f"[TTS] SAPI initialization failed ({e}), falling back to pyttsx3.")
+                sapi_voice = None
+
+        # 2. Fallback to pyttsx3
+        if sapi_voice is None:
+            try:
+                import pyttsx3
+                pyttsx_engine = pyttsx3.init()
+                pyttsx_engine.setProperty("rate", self.rate)
+                pyttsx_engine.setProperty("volume", 1.0)
+                print("[TTS] pyttsx3 Speech Synthesizer initialized.")
+            except Exception as e:
+                print(f"[TTS] pyttsx3 initialization failed ({e}).")
+
         while not self._stop_event.is_set():
             try:
-                text = self.queue.get(timeout=0.2)
+                sent = self.queue.get(timeout=0.15)
             except queue.Empty:
+                self._current_sentence = ""
+                self._speaking_event.clear()
                 continue
 
+            if not self.enabled:
+                self.queue.task_done()
+                continue
+
+            self._current_sentence = sent
+            self._speaking_event.set()
+            print(f"[AUDIO] Reading aloud: \"{sent}\"")
+
             try:
-                self.engine.say(text)
-                self.engine.runAndWait()
+                if sapi_voice is not None:
+                    # SVSFDefault = 0 (Synchronous in this worker thread)
+                    sapi_voice.Speak(sent)
+                elif pyttsx_engine is not None:
+                    pyttsx_engine.say(sent)
+                    pyttsx_engine.runAndWait()
+                elif os.name == "nt":
+                    # Fallback via PowerShell
+                    import subprocess
+                    clean_msg = sent.replace("'", "").replace('"', "")
+                    cmd = f"Add-Type -AssemblyName System.speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{clean_msg}');"
+                    subprocess.run(["powershell", "-NoProfile", "-Command", cmd], creationflags=subprocess.CREATE_NO_WINDOW, timeout=5.0)
+                else:
+                    # Linux / Raspberry Pi fallback
+                    import subprocess
+                    subprocess.run(["espeak-ng", sent], stderr=subprocess.DEVNULL, timeout=5.0)
             except Exception as e:
-                print(f"[TTS] error speaking: {e}")
+                print(f"[TTS] Error during speech synthesis: {e}")
             finally:
+                self._current_sentence = ""
+                self._speaking_event.clear()
                 self.queue.task_done()
 
 
@@ -256,6 +318,8 @@ def draw_ocr_hud(
     fps: float,
     mode: str,
     voice_enabled: bool,
+    is_speaking: bool,
+    current_spoken_sentence: str,
     show_preproc: bool,
     last_text: str,
     boxes: list,
@@ -307,26 +371,36 @@ def draw_ocr_hud(
     cv2.circle(canvas, (18, 21), 6, (0, 255, 0), -1)
     cv2.putText(canvas, f"CAM: {cam_label}", (32, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.52, cam_color, 2, cv2.LINE_AA)
 
-    # Mode, Voice, Preproc indicators
+    # Mode indicator
     mode_str = f"MODE: {mode.upper()}"
-    cv2.putText(canvas, mode_str, (w // 2 - 120, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1, cv2.LINE_AA)
+    cv2.putText(canvas, mode_str, (w // 2 - 130, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1, cv2.LINE_AA)
 
-    voice_str = f"VOICE: {'ON' if voice_enabled else 'OFF'}"
-    v_col = (0, 255, 120) if voice_enabled else (120, 120, 120)
-    cv2.putText(canvas, voice_str, (w // 2 + 50, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.48, v_col, 2, cv2.LINE_AA)
+    # Voice & Speaking indicator
+    if is_speaking:
+        voice_str = "VOICE: SPEAKING ALOUD"
+        v_col = (0, 255, 255)
+    elif voice_enabled:
+        voice_str = "VOICE: READY"
+        v_col = (0, 255, 120)
+    else:
+        voice_str = "VOICE: MUTED"
+        v_col = (120, 120, 120)
+
+    cv2.putText(canvas, voice_str, (w // 2 + 30, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.48, v_col, 2, cv2.LINE_AA)
 
     fps_str = f"FPS: {fps:.1f}"
     cv2.putText(canvas, fps_str, (w - 110, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
 
     # 3. Bottom Card: Extracted Text Transcript
-    card_h = 135
+    card_h = 145
     card_y = h - card_h
     overlay2 = canvas.copy()
     cv2.rectangle(overlay2, (0, card_y), (w, h), (15, 15, 18), -1)
     cv2.addWeighted(overlay2, 0.88, canvas, 0.12, 0, canvas)
 
     # Border separator
-    cv2.line(canvas, (0, card_y), (w, card_y), (0, 255, 180), 2)
+    border_color = (0, 255, 255) if is_speaking else (0, 255, 180)
+    cv2.line(canvas, (0, card_y), (w, card_y), border_color, 2)
 
     # Header in Card
     header_text = f"EXTRACTED TEXT ({len(last_text)} chars"
@@ -336,10 +410,13 @@ def draw_ocr_hud(
         header_text += f" | Sharpness: {focus_score:.1f}"
     header_text += ")"
 
-    cv2.putText(canvas, header_text, (16, card_y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 180), 1, cv2.LINE_AA)
+    cv2.putText(canvas, header_text, (16, card_y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, border_color, 1, cv2.LINE_AA)
 
-    # Render wrapped text lines
-    if last_text.strip():
+    # Render Active Spoken Sentence or Extracted Text
+    if is_speaking and current_spoken_sentence:
+        spk_label = f"Speaking Now: \"{current_spoken_sentence}\""
+        cv2.putText(canvas, spk_label[:100], (18, card_y + 52), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
+    elif last_text.strip():
         # Wrap text nicely across card width
         words = last_text.split()
         lines = []
@@ -357,7 +434,7 @@ def draw_ocr_hud(
         if curr_line and len(lines) < 3:
             lines.append(curr_line)
 
-        y_offset = card_y + 50
+        y_offset = card_y + 52
         for line in lines:
             cv2.putText(canvas, line, (18, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
             y_offset += 24
@@ -376,7 +453,7 @@ def draw_ocr_hud(
     # 4. Status Prompt / Key Shortcuts Bar
     cv2.putText(
         canvas,
-        "[SPACE]: Read OCR  |  [n]: Switch Cam  |  [m]: Mode  |  [v]: Voice  |  [s]: Save  |  [q]: Quit",
+        "[SPACE]: Read OCR  |  [t]: Test Voice  |  [n]: Switch Cam  |  [m]: Mode  |  [v]: Voice  |  [s]: Save  |  [q]: Quit",
         (16, card_y + card_h - 12),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.42,
@@ -385,7 +462,7 @@ def draw_ocr_hud(
         cv2.LINE_AA,
     )
 
-    # 5. Temporary Action Flash (e.g. "Saved to runs/ocr_tests/...")
+    # 5. Temporary Action Flash
     if status_msg:
         (stw, sth), _ = cv2.getTextSize(status_msg, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
         cv2.rectangle(
@@ -421,7 +498,7 @@ def run_ocr_testing(
     burst_count: int = 3,
 ):
     print("\n" + "=" * 75)
-    print(" 📖 LIVE OCR TESTING WITH iVCam MOBILE CAMERA")
+    print(" [OCR] LIVE OCR TESTING WITH iVCam MOBILE CAMERA")
     print("=" * 75)
 
     # 1. Discover available cameras
@@ -435,13 +512,14 @@ def run_ocr_testing(
         active_cam_idx = cam_index
     elif any(c[0] == 1 for c in cams):
         active_cam_idx = 1
-        print("[✓] Automatically selected [1] e2eSoft iVCam (Mobile Camera)")
+        print("[[OK]] Automatically selected [1] e2eSoft iVCam (Mobile Camera)")
     else:
         active_cam_idx = cams[0][0]
-        print(f"[✓] Defaulting to camera [{active_cam_idx}] ({cams[0][1]})")
+        print(f"[[OK]] Defaulting to camera [{active_cam_idx}] ({cams[0][1]})")
 
     # 2. Initialize Audio TTS Speaker
     speaker = AsyncSpeaker(rate=170, enabled=voice)
+    time.sleep(0.3)
     speaker.speak("OCR mobile camera testing ready. Press space to read.")
 
     # 3. Create output directory for saving snapshots & transcripts
@@ -474,12 +552,13 @@ def run_ocr_testing(
     print("\n" + "-" * 75)
     print("  KEYBOARD CONTROLS:")
     print("    [SPACE] / [r] : Run OCR & read text aloud via TTS")
+    print("    [t]           : Test Voice (Immediately speaks a test sentence)")
     print("    [n]           : Switch Camera (Toggle between iVCam Mobile & Laptop)")
     print("    [m]           : Toggle Mode (Book Mode <-> Screen Mode)")
     print("    [p]           : Toggle Preprocessing Binary View")
     print("    [v]           : Toggle Voice TTS reading")
     print("    [s]           : Save snapshot & text to runs/ocr_tests/")
-    print("    [c]           : Clear text")
+    print("    [c]           : Clear text & stop speech")
     print("    [q] / [ESC]   : Quit")
     print("-" * 75 + "\n")
 
@@ -531,6 +610,8 @@ def run_ocr_testing(
                     fps=avg_fps,
                     mode=current_mode,
                     voice_enabled=voice_active,
+                    is_speaking=speaker.is_speaking(),
+                    current_spoken_sentence=speaker.get_current_sentence(),
                     show_preproc=show_preproc_view,
                     last_text=last_extracted_text,
                     boxes=detected_boxes,
@@ -584,14 +665,20 @@ def run_ocr_testing(
                     print(f"    -> Recognized Text:\n\"{last_extracted_text}\"\n")
 
                     if last_extracted_text:
-                        status_message = f"Found {len(detected_boxes)} text blocks!"
+                        status_message = f"Found {len(detected_boxes)} text blocks! Reading..."
                         if voice_active:
-                            speaker.speak(last_extracted_text)
+                            speaker.speak(last_extracted_text, interrupt=True)
                     else:
                         status_message = "No clear text detected! Hold closer or adjust lighting."
                         if voice_active:
-                            speaker.speak("I couldn't find any text on that page.")
+                            speaker.speak("I couldn't find any clear text. Try holding closer or improving light.")
                     status_time = time.time()
+
+            elif key == ord("t"):  # Audio test key
+                print("\n[[AUDIO]] Audio test triggered by user (Pressing [t])...")
+                status_message = "Audio Test: Speaking aloud..."
+                status_time = time.time()
+                speaker.speak("Audio test. Voice synthesizer is working loud and clear.", interrupt=True)
 
             elif key == ord("n"):  # Switch Camera
                 available_indices = [c[0] for c in cams]
@@ -649,14 +736,14 @@ def run_ocr_testing(
 
                 status_message = f"Saved snapshot to {img_path.name}"
                 status_time = time.time()
-                print(f"[✓] Saved snapshot: {img_path}")
-                print(f"[✓] Saved transcript: {txt_path}")
+                print(f"[[OK]] Saved snapshot: {img_path}")
+                print(f"[[OK]] Saved transcript: {txt_path}")
 
             elif key == ord("c"):  # Clear
                 last_extracted_text = ""
                 detected_boxes = []
                 speaker.stop()
-                status_message = "Cleared text display."
+                status_message = "Cleared text & stopped speech."
                 status_time = time.time()
 
     except KeyboardInterrupt:
@@ -668,7 +755,7 @@ def run_ocr_testing(
         speaker.stop()
         stream.stop()
         cv2.destroyAllWindows()
-        print("[✓] Clean exit completed.")
+        print("[[OK]] Clean exit completed.")
 
 
 # ==============================================================================
